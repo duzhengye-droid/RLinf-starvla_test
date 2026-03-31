@@ -21,13 +21,13 @@ from collections.abc import Mapping
 from typing import Any, Optional
 
 import numpy as np
-import torch
 
 
 def resolve_action_norm_stats(
     starvla_model: Any,
     unnorm_key: Optional[str],
     action_dim: int,
+    action_stats_source: Optional[str] = None,
 ) -> Optional[dict[str, np.ndarray]]:
     """Resolve action normalization stats from starVLA.
 
@@ -71,12 +71,29 @@ def resolve_action_norm_stats(
             f"unnorm_key={unnorm_key!r}."
         )
 
-    high_src = stats_payload.get("q99", stats_payload.get("max"))
-    low_src = stats_payload.get("q01", stats_payload.get("min"))
+    source = (
+        "q01q99"
+        if action_stats_source is None
+        else str(action_stats_source).strip().lower()
+    )
+    if source in ("minmax", "maxmin"):
+        high_src = stats_payload.get("max")
+        low_src = stats_payload.get("min")
+        missing_label = "max/min"
+    elif source in ("q01q99", "q99q01", "percentile"):
+        high_src = stats_payload.get("q99", stats_payload.get("max"))
+        low_src = stats_payload.get("q01", stats_payload.get("min"))
+        missing_label = "q99/q01 (or max/min fallback)"
+    else:
+        raise ValueError(
+            "Unsupported starVLA action_stats_source. "
+            f"Expected 'q01q99' or 'minmax', got {action_stats_source!r}."
+        )
+
     if high_src is None or low_src is None:
         raise RuntimeError(
-            "starVLA action norm stats missing q99/q01 (or max/min); cannot unnormalize "
-            f"actions for env. unnorm_key={unnorm_key!r}."
+            f"starVLA action norm stats missing {missing_label}; cannot unnormalize "
+            f"actions for env. unnorm_key={unnorm_key!r}, action_stats_source={source!r}."
         )
 
     try:
@@ -113,9 +130,30 @@ def resolve_action_norm_stats(
     }
 
 
-def _gripper_mapping(actions: np.ndarray) -> np.ndarray:
-    """Apply LIBERO gripper mapping aligned with starVLA eval pipeline."""
-    if str(os.environ.get("ROBOT_PLATFORM", "")).upper() != "LIBERO":
+_LIBERO_PLATFORMS = {"libero"}
+
+
+def _gripper_mapping(
+    actions: np.ndarray,
+    policy_setup: Optional[str] = None,
+) -> np.ndarray:
+    """Apply LIBERO gripper mapping aligned with starVLA eval pipeline.
+
+    Converts gripper dim (index 6) from 0/1 (as output by
+    ``baseframework.unnormalize_actions``) to +1/-1 as expected by the
+    LIBERO env.
+
+    The mapping is activated when *policy_setup* resolves to a LIBERO
+    platform.  When *policy_setup* is ``None`` we fall back to the
+    ``ROBOT_PLATFORM`` env-var for backward compatibility.
+    """
+    resolved_platform: str
+    if policy_setup is not None:
+        resolved_platform = str(policy_setup).strip().lower()
+    else:
+        resolved_platform = str(os.environ.get("ROBOT_PLATFORM", "")).strip().lower()
+
+    if resolved_platform not in _LIBERO_PLATFORMS:
         return actions
     if actions.shape[-1] < 7:
         return actions
@@ -131,8 +169,17 @@ def _gripper_mapping(actions: np.ndarray) -> np.ndarray:
 def unnormalize_actions_for_env(
     normalized_actions: np.ndarray,
     action_norm_stats: dict[str, np.ndarray],
+    policy_setup: Optional[str] = None,
 ) -> np.ndarray:
-    """Map model normalized actions to env action space (strict)."""
+    """Map model normalized actions to env action space (strict).
+
+    Args:
+        normalized_actions: Actions in normalized [-1, 1] space from the model.
+        action_norm_stats: Dict with ``q99``, ``q01``, ``mask`` arrays.
+        policy_setup: Robot platform identifier (e.g. ``"libero"``).
+            When provided, the gripper mapping is decided by this value
+            instead of the ``ROBOT_PLATFORM`` environment variable.
+    """
     if action_norm_stats is None:
         raise RuntimeError(
             "Missing action_norm_stats: cannot unnormalize actions for env. "
@@ -155,16 +202,4 @@ def unnormalize_actions_for_env(
     }
     env_flat = baseframework.unnormalize_actions(flat, starvla_stats)
     env_actions = np.asarray(env_flat, dtype=np.float32).reshape(actions.shape)
-    return _gripper_mapping(env_actions)
-
-
-def clip_actions_for_env(actions: torch.Tensor) -> torch.Tensor:
-    """Clip action range and discretize gripper dimension for env stepping."""
-    clipped = actions.clamp(-1.0, 1.0)
-    if clipped.shape[-1] >= 7:
-        clipped[..., 6] = torch.where(
-            clipped[..., 6] < 0.5,
-            torch.zeros_like(clipped[..., 6]),
-            torch.ones_like(clipped[..., 6]),
-        )
-    return clipped
+    return _gripper_mapping(env_actions, policy_setup=policy_setup)

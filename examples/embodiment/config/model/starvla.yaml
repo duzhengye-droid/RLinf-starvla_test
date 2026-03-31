@@ -25,6 +25,9 @@ policy_setup: "libero"
 # starVLA checkpoints expose action normalization stats under a string key.
 # For LIBERO Franka tasks, the common key is "franka"; override if your checkpoint differs.
 unnorm_key: "franka"
+# Choose which checkpoint action-range statistics to use for env unnormalization.
+# The official StarVLA LIBERO client uses min/max instead of q01/q99.
+action_stats_source: "minmax"
 
 # RL head behavior (wrapper-side value head).
 # For GRPO actor-only this can stay False; for PPO actor_critic set to True.
@@ -37,6 +40,9 @@ low_cpu_mem_usage: True
 # Optional explicit namespace used by rlinf.models.embodiment.starvla.get_model
 starvla:
   ckpt_path: ${actor.model.model_path}
+  # Unified starVLA wrapper switch for feeding proprio/state into action heads.
+  # Applies to Adapter / PI / GR00T / Dual paths. OFT remains state-free.
+  enable_state_input: True
   # Informational fields for consistency checks in experiment configs.
   framework_name: "QwenOFT"
   expected_action_dim: ${actor.model.action_dim}

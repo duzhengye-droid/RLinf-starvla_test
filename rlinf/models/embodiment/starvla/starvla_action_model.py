@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 import warnings
 from functools import partial
 from typing import Any, Optional
@@ -35,6 +36,8 @@ from .utils.profile import (
     infer_policy_profile,
     iter_gradient_checkpointing_targets,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
@@ -57,6 +60,9 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         num_action_chunks: int,
         add_value_head: bool = True,
         unnorm_key: Optional[str] = None,
+        action_stats_source: str = "minmax",
+        enable_state_input: bool = True,
+        policy_setup: Optional[str] = None,
     ):
         super().__init__()
 
@@ -70,18 +76,23 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
                 "Set 'actor.model.unnorm_key' (e.g. 'franka' for LIBERO)."
             )
         self.unnorm_key = str(unnorm_key)
+        self.action_stats_source = str(action_stats_source)
+        self.enable_state_input = bool(enable_state_input)
+        self.policy_setup = str(policy_setup).strip().lower() if policy_setup else None
 
         # 2) Action unnormalization stats (strict: required when unnorm_key is set).
         self._action_norm_stats = action_space_utils.resolve_action_norm_stats(
             starvla_model=self.starvla_model,
             unnorm_key=self.unnorm_key,
             action_dim=self.action_dim,
+            action_stats_source=self.action_stats_source,
         )
 
         # 3) Dispatch profile (action head + state adapter).
         policy_profile = infer_policy_profile(starvla_model)
-        self.action_head_type = policy_profile.action_head_type
-        self.state_adapter_type = policy_profile.state_adapter_type
+        self.action_head_type = policy_profile["action_head_type"]
+        self.state_adapter_type = policy_profile["state_adapter_type"]
+        self.vlm_type = policy_profile["vlm_type"]
 
         # 4) Resolve policy parameter dtype (used for added heads/params).
         policy_param_dtype = next(
@@ -101,6 +112,11 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
 
         # 6) Rollout/training caches.
         self._rollout_prompt_seq_len: Optional[int] = None
+
+    @property
+    def uses_state_input(self) -> bool:
+        """Return whether the active policy path should consume proprio/state."""
+        return self.enable_state_input and self.action_head_type != "oft"
 
     def forward(
         self,
@@ -214,6 +230,7 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
                 starvla_model=self.starvla_model,
                 default_state_adapter_name=self.state_adapter_type,
             ),
+            include_state=self.uses_state_input,
         )
         # Build sampling kwargs and initialize forward_inputs with batch-aligned sampling tensors.
         sampling_kwargs = {
@@ -321,6 +338,7 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         env_chunk_actions = action_space_utils.unnormalize_actions_for_env(
             normalized_actions=normalized_actions.astype(np.float32),
             action_norm_stats=self._action_norm_stats,
+            policy_setup=self.policy_setup,
         )
 
         forward_inputs["action"] = torch.from_numpy(env_chunk_actions.reshape(bsz, -1))

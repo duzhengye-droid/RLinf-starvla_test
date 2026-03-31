@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 from torch.distributions.normal import Normal
 
-from ..utils import action_space as action_space_utils
 from ..utils import data_pipeline as data_pipeline_utils
 from ..utils import state as state_utils
 from ..utils import vlm_preprocess as vlm_input_utils
@@ -120,11 +119,12 @@ def _run_adapter_pipeline(
     # 3) Run the shared VLM backbone once with query injection enabled.
     backbone_output = run_backbone_pipeline(
         policy,
+        action_head_name="adapter",
         model_inputs=model_inputs,
         use_cache=use_cache,
         input_embedding_hook=inject_query_hook,
     )
-    hidden_states = backbone_output.hidden_layers
+    hidden_states = backbone_output["hidden_layers"]
 
     # 4) Resolve the image token id and recover the contiguous visual token span
     # for each sample from the prompt sequence.
@@ -166,17 +166,12 @@ def _run_adapter_pipeline(
             "Adapter action head requires image tokens in 'input_ids', "
             f"but none were found for batch indices {bad_idx} with image_token_id={image_token_id}."
         )
-    # Find the start and end positions of the visual token span for each sample
+    # Official QwenAdapter.get_image_token_counts computes first_index via
+    # cumsum().argmin() which always yields 0 — the pretrained model was trained
+    # with text tokens preceding images included in the "vision" feature span.
+    # We replicate that here for eval alignment.
+    first_index_per_sample = torch.zeros(batch_size, dtype=torch.long, device=device)
     seq_indices = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
-    first_index_per_sample = (
-        torch.where(
-            image_mask,
-            seq_indices,
-            torch.full_like(seq_indices, fill_value=seq_len),
-        )
-        .min(dim=1)
-        .values
-    )
     last_index_per_sample = (
         torch.where(
             image_mask,
@@ -281,9 +276,11 @@ def run_default_forward_adapter(
     """Compute training-time PPO terms for the Adapter action head."""
     data_pipeline_utils.forward_input_check(data)
 
-    state = data.get("state")
-    if state is None:
-        state = data.get("states")
+    state = None
+    if policy.uses_state_input:
+        state = data.get("state")
+        if state is None:
+            state = data.get("states")
 
     model_inputs = data_pipeline_utils.collect_default_forward_model_inputs(
         data,
@@ -323,7 +320,8 @@ def run_default_forward_adapter(
                 dtype=torch.float32,
             )
         else:
-            result["values"] = policy.value_head(critic_features.float()).to(
+            vh_dtype = next(policy.value_head.parameters()).dtype
+            result["values"] = policy.value_head(critic_features.to(dtype=vh_dtype)).to(
                 dtype=torch.float32
             )
     return result
@@ -340,13 +338,15 @@ def run_rollout_adapter(
     env_obs: dict[str, Any],
 ) -> dict[str, Any]:
     """Roll out the Adapter action head and pack replay caches for training."""
-    state = state_utils.prepare_state_tensor(
-        env_obs.get("states"),
-        starvla_model=policy.starvla_model,
-        default_state_adapter_name=policy.state_adapter_type,
-        state_adapter_name="adapter",
-        context="predict_action_batch_state",
-    )
+    state = None
+    if policy.uses_state_input:
+        state = state_utils.prepare_state_tensor(
+            env_obs.get("states"),
+            starvla_model=policy.starvla_model,
+            default_state_adapter_name=policy.state_adapter_type,
+            state_adapter_name="adapter",
+            context="predict_action_batch_state",
+        )
 
     model_inputs = _build_adapter_vlm_inputs(
         policy,
@@ -363,7 +363,6 @@ def run_rollout_adapter(
 
     sample_actions = bool(sampling_kwargs.get("do_sample")) and mode == "train"
     actions_for_logprob = dist.sample() if sample_actions else mean_actions
-    actions_exec = action_space_utils.clip_actions_for_env(actions_for_logprob)
 
     prev_logprobs: Optional[torch.Tensor] = None
     prev_values: Optional[torch.Tensor] = None
@@ -377,14 +376,15 @@ def run_rollout_adapter(
                 dtype=torch.float32,
             )
         else:
-            prev_values = policy.value_head(critic_features.float()).to(
+            vh_dtype = next(policy.value_head.parameters()).dtype
+            prev_values = policy.value_head(critic_features.to(dtype=vh_dtype)).to(
                 dtype=torch.float32
             )
 
     return {
         "output": {
             "normalized_actions": data_pipeline_utils.tensor_to_numpy_compatible(
-                actions_exec
+                mean_actions
             )
         },
         "model_inputs": model_inputs,

@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch.nn as nn
@@ -37,16 +36,6 @@ _ACTION_HEAD_BY_TOKEN: dict[str, str] = {
     "groot": "gr00t",
     "dual": "dual",
 }
-
-
-@dataclass(frozen=True)
-class PolicyProfile:
-    """Resolved policy wiring: VLM family, action head, and state-adapter mode."""
-
-    vlm_type: str
-    action_head_type: str
-    state_adapter_type: str
-
 
 RL_BATCH_TENSOR_KEYS_TO_IGNORE: set[str] = {
     "action",
@@ -118,94 +107,57 @@ def resolve_vlm_interface(starvla_model: nn.Module) -> Any:
     )
 
 
-def _resolve_framework_name(starvla_model: nn.Module) -> Optional[str]:
-    """Fetch configured framework name from model/config candidates."""
-    candidates = [getattr(starvla_model, "framework_name", None)]
+def infer_policy_profile(starvla_model: nn.Module) -> dict[str, str]:
+    """Build full policy profile used by dispatch and runtime checks."""
     cfg = getattr(starvla_model, "config", None)
-    if cfg is not None:
-        candidates.append(getattr(cfg, "framework_name", None))
-        framework_cfg = getattr(cfg, "framework", None)
-        if framework_cfg is not None:
-            candidates.append(getattr(framework_cfg, "framework_name", None))
+    framework_name = None
+    framework_vlm = None
+    framework_action_head = None
 
-    for candidate in candidates:
+    for candidate in (
+        getattr(starvla_model, "framework_name", None),
+        getattr(cfg, "framework_name", None) if cfg is not None else None,
+        getattr(getattr(cfg, "framework", None), "framework_name", None)
+        if cfg is not None
+        else None,
+    ):
         if candidate is None:
             continue
         text = str(candidate).strip()
         if text:
-            return text
-    return None
+            framework_name = text
+            break
 
-
-def _infer_from_framework_name(
-    starvla_model: nn.Module,
-) -> tuple[Optional[str], Optional[str]]:
-    """Parse framework name tokens into '(vlm_type, action_head_type)'."""
-    framework_name = _resolve_framework_name(starvla_model)
-    if framework_name is None:
-        return None, None
-    norm = "".join(ch for ch in str(framework_name).lower() if ch.isalnum())
-
-    vlm_matches = [vlm for token, vlm in _VLM_TYPE_BY_TOKEN.items() if token in norm]
-    vlm_matches = list(dict.fromkeys(vlm_matches))
-    if len(vlm_matches) > 1:
-        raise RuntimeError(
-            f"Ambiguous framework_name={framework_name!r}: multiple VLM tokens matched {vlm_matches}."
+    if framework_name is not None:
+        framework_norm = "".join(
+            ch for ch in str(framework_name).lower() if ch.isalnum()
         )
-    vlm_type = vlm_matches[0] if vlm_matches else None
 
-    head_matches = [
-        head for token, head in _ACTION_HEAD_BY_TOKEN.items() if token in norm
-    ]
-    head_matches = list(dict.fromkeys(head_matches))
-    if len(head_matches) > 1:
-        raise RuntimeError(
-            f"Ambiguous framework_name={framework_name!r}: multiple action-head tokens matched {head_matches}."
-        )
-    action_head = head_matches[0] if head_matches else None
-    return vlm_type, action_head
+        vlm_matches = [
+            vlm for token, vlm in _VLM_TYPE_BY_TOKEN.items() if token in framework_norm
+        ]
+        vlm_matches = list(dict.fromkeys(vlm_matches))
+        if len(vlm_matches) > 1 or len(vlm_matches) == 0:
+            raise RuntimeError(f"Ambiguous framework_name={framework_name!r}.")
+        if len(vlm_matches) == 1:
+            framework_vlm = vlm_matches[0]
 
+        head_matches = [
+            head
+            for token, head in _ACTION_HEAD_BY_TOKEN.items()
+            if token in framework_norm
+        ]
+        head_matches = list(dict.fromkeys(head_matches))
+        if len(head_matches) > 1 or len(head_matches) == 0:
+            raise RuntimeError(f"Ambiguous framework_name={framework_name!r}.")
+        if len(head_matches) == 1:
+            framework_action_head = head_matches[0]
 
-def infer_vlm_type(starvla_model: nn.Module) -> str:
-    """Infer VLM family used by the checkpoint."""
-    framework_vlm, _ = _infer_from_framework_name(starvla_model)
-    if framework_vlm is not None:
-        return framework_vlm
-
-    cfg = getattr(starvla_model, "config", None)
     framework_cfg = getattr(cfg, "framework", None) if cfg is not None else None
     qwenvl_cfg = (
         getattr(framework_cfg, "qwenvl", None) if framework_cfg is not None else None
     )
     base_vlm = getattr(qwenvl_cfg, "base_vlm", None) if qwenvl_cfg is not None else None
-    if base_vlm is not None:
-        norm = "".join(ch for ch in str(base_vlm).lower() if ch.isalnum())
-        matches = [vlm for token, vlm in _VLM_TYPE_BY_TOKEN.items() if token in norm]
-        matches = list(dict.fromkeys(matches))
-        if len(matches) > 1:
-            raise RuntimeError(
-                f"Ambiguous base_vlm={base_vlm!r}: multiple VLM tokens matched {matches}."
-            )
-        if len(matches) == 1:
-            return matches[0]
-
-    framework_name = _resolve_framework_name(starvla_model)
-    raise RuntimeError(
-        "Unable to infer VLM type for starVLA model. "
-        "Set 'framework_name' (e.g. QwenDual/FlorenceGR00T/CosmosPI) or "
-        "'config.framework.qwenvl.base_vlm' explicitly. "
-        f"framework_name={framework_name!r}, base_vlm={base_vlm!r}."
-    )
-
-
-def infer_action_head_type(starvla_model: nn.Module) -> str:
-    """Infer action-head type used by the checkpoint."""
-    _, framework_action_head = _infer_from_framework_name(starvla_model)
-    if framework_action_head is not None:
-        return framework_action_head
-
-    cfg = getattr(starvla_model, "config", None)
-    framework_cfg = getattr(cfg, "framework", None) if cfg is not None else None
     action_cfg = (
         getattr(framework_cfg, "action_model", None)
         if framework_cfg is not None
@@ -216,35 +168,33 @@ def infer_action_head_type(starvla_model: nn.Module) -> str:
         if action_cfg is not None
         else None
     )
-    if cfg_head_type is not None:
-        cfg_head_type = str(cfg_head_type).strip().lower()
-        if cfg_head_type in ACTION_HEAD_TYPES:
-            return cfg_head_type
+
+    if framework_vlm is None:
         raise RuntimeError(
-            "Invalid 'config.framework.action_model.action_head_type'. "
-            f"Got {cfg_head_type!r}, expected one of {sorted(ACTION_HEAD_TYPES)}."
+            "Unable to infer VLM type for starVLA model. "
+            "Set 'framework_name' (e.g. QwenDual/FlorenceGR00T/CosmosPI) or "
+            "'config.framework.qwenvl.base_vlm' explicitly. "
+            f"framework_name={framework_name!r}, base_vlm={base_vlm!r}."
         )
 
-    raise RuntimeError(
-        "Unable to infer action_head_type for starVLA model. "
-        "Set 'framework_name' (e.g. QwenDual/FlorenceGR00T/CosmosPI) or "
-        "'config.framework.action_model.action_head_type' explicitly to one of: "
-        "fast/oft/adapter/pi/gr00t/dual."
-    )
+    if framework_action_head is None:
+        raise RuntimeError(
+            "Unable to infer action_head_type for starVLA model. "
+            f"cfg_head_type is {cfg_head_type!r}."
+            "Set 'framework_name' (e.g. QwenDual/FlorenceGR00T/CosmosPI) or "
+            "'config.framework.action_model.action_head_type' explicitly to one of: "
+            "fast/oft/adapter/pi/gr00t/dual."
+        )
 
-
-def infer_policy_profile(starvla_model: nn.Module) -> PolicyProfile:
-    """Build full policy profile used by dispatch and runtime checks."""
-    action_head_type = infer_action_head_type(starvla_model)
-    if action_head_type in {"adapter", "pi", "gr00t", "dual"}:
-        state_adapter_type = action_head_type
+    if framework_action_head in {"adapter", "pi", "gr00t", "dual"}:
+        state_adapter_type = framework_action_head
     else:
         state_adapter_type = "none"
-    return PolicyProfile(
-        vlm_type=infer_vlm_type(starvla_model),
-        action_head_type=action_head_type,
-        state_adapter_type=state_adapter_type,
-    )
+    return {
+        "vlm_type": framework_vlm,
+        "action_head_type": framework_action_head,
+        "state_adapter_type": state_adapter_type,
+    }
 
 
 def infer_hidden_size(starvla_model: nn.Module) -> int:
@@ -272,10 +222,11 @@ def resolve_action_chunk_len(
     action_head_name: Optional[str] = None,
 ) -> int:
     """Resolve rollout/train action horizon for a specific action head."""
-    head = action_head_name or infer_action_head_type(starvla_model)
-    if head not in ACTION_HEAD_TYPES:
+    if action_head_name is None:
+        action_head_name = infer_policy_profile(starvla_model)["action_head_type"]
+    if action_head_name not in ACTION_HEAD_TYPES:
         raise ValueError(
-            f"Unknown action_head_name={head!r}. Expected one of {sorted(ACTION_HEAD_TYPES)}."
+            f"Unknown action_head_name={action_head_name!r}. Expected one of {sorted(ACTION_HEAD_TYPES)}."
         )
 
     cfg = getattr(starvla_model, "config", None)
@@ -295,7 +246,7 @@ def resolve_action_chunk_len(
         except (TypeError, ValueError):
             return None
 
-    if head == "fast":
+    if action_head_name == "fast":
         tokenizer = getattr(
             getattr(starvla_model, "action_model", None), "fast_tokenizer", None
         )
@@ -306,13 +257,13 @@ def resolve_action_chunk_len(
         if future is not None:
             return future + 1
 
-    if head in {"oft", "pi", "gr00t", "dual"}:
+    if action_head_name in {"oft", "pi", "gr00t", "dual"}:
         past = cfg_int("past_action_window_size")
         future = cfg_int("future_action_window_size")
         if past is not None and future is not None:
             return past + 1 + future
 
-    if head == "adapter":
+    if action_head_name == "adapter":
         num_actions_chunk = cfg_int("num_actions_chunk")
         if num_actions_chunk is not None:
             return num_actions_chunk

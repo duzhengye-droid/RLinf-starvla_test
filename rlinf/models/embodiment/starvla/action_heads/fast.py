@@ -26,7 +26,6 @@ from ..utils import vlm_preprocess as vlm_input_utils
 from ..utils.backbone_pipeline import compute_values_from_hidden, run_backbone_pipeline
 from ..utils.profile import (
     RL_BATCH_TENSOR_KEYS_TO_IGNORE,
-    infer_vlm_type,
     resolve_action_chunk_len,
     resolve_vlm_interface,
 )
@@ -175,10 +174,11 @@ def run_default_forward_fast(
     # Re-run the backbone on the reconstructed sequence and keep only the action suffix logits.
     backbone_output = run_backbone_pipeline(
         policy,
+        action_head_name="fast",
         model_inputs=model_inputs,
         use_cache=use_cache,
     )
-    action_logits = backbone_output.extras.get("logits")
+    action_logits = backbone_output["extras"].get("logits")
     if not isinstance(action_logits, torch.Tensor):
         raise RuntimeError(
             "FAST handler requires 'logits' in backbone extras for sampling/logprob."
@@ -247,8 +247,11 @@ def run_default_forward_fast(
                 (bsz, 1), device=action_logits.device, dtype=torch.float32
             )
         else:
-            feat = backbone_output.last_hidden[:, -(num_action_tokens + 1), :].float()
-            result["values"] = policy.value_head(feat).to(dtype=torch.float32)
+            feat = backbone_output["last_hidden"][:, -(num_action_tokens + 1), :]
+            vh_dtype = next(policy.value_head.parameters()).dtype
+            result["values"] = policy.value_head(feat.to(dtype=vh_dtype)).to(
+                dtype=torch.float32
+            )
 
     return result
 
@@ -270,16 +273,17 @@ def run_rollout_fast(
     if calculate_values:
         backbone_output = run_backbone_pipeline(
             policy,
+            action_head_name="fast",
             examples=examples,
             use_cache=False,
         )
-        model_inputs = dict(backbone_output.model_inputs)
+        model_inputs = dict(backbone_output["model_inputs"])
     else:
         starvla_model = policy.starvla_model
         model_inputs = vlm_input_utils.build_base_vlm_inputs(
             starvla_model,
             examples=examples,
-            vlm_type=infer_vlm_type(starvla_model),
+            vlm_type=policy.vlm_type,
         )
 
     prompt_inputs = dict(model_inputs)
@@ -531,8 +535,8 @@ def run_rollout_fast(
         else:
             prev_values = compute_values_from_hidden(
                 value_head=policy.value_head,
-                hidden=backbone_output.last_hidden,
-                attention_mask=backbone_output.attention_mask,
+                hidden=backbone_output["last_hidden"],
+                attention_mask=backbone_output["attention_mask"],
             )
 
     extra_forward_inputs: dict[str, torch.Tensor] = {

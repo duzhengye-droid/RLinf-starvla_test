@@ -18,20 +18,18 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from math import sqrt
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
-from ..utils import action_space as action_space_utils
 from ..utils import data_pipeline as data_pipeline_utils
 from ..utils import state as state_utils
 from ..utils import vlm_preprocess as vlm_input_utils
 from ..utils.backbone_pipeline import (
-    BackboneOutput,
     compute_values_from_hidden,
     run_backbone_pipeline,
 )
@@ -40,11 +38,50 @@ from ..utils.profile import RL_BATCH_TENSOR_KEYS_TO_IGNORE
 if TYPE_CHECKING:
     from ..starvla_action_model import StarVLAForRLActionPrediction
 
-_FLOW_PREFIX_BY_ACTION_HEAD = {
-    "pi": "pi",
-    "gr00t": "gr00t",
-    "dual": "dual",
-}
+_FLOW_PREFIX_BY_ACTION_HEAD = ["pi", "gr00t", "dual"]
+
+_TIMESTEP_ENCODER_PATCHED: set[int] = set()
+
+
+def _patch_timestep_encoder_for_fsdp(head: nn.Module) -> None:
+    """Monkey-patch TimestepEncoder.forward to survive FSDP parameter flattening.
+
+    Under FSDP the sub-module's own ``self.parameters()`` iterator may be empty
+    because all parameters are lifted into the top-level FSDP unit.  The upstream
+    ``cross_attention_dit.TimestepEncoder.forward`` calls
+    ``next(self.parameters()).dtype`` which then raises ``StopIteration``.
+
+    We fix this *without* editing the upstream file* by storing a fallback dtype
+    on the encoder instance and replacing its ``forward`` with one that handles
+    the empty-parameters case.
+    """
+    dit_model = getattr(head, "model", None)
+    if dit_model is None:
+        return
+    ts_enc = getattr(dit_model, "timestep_encoder", None)
+    if ts_enc is None:
+        return
+    obj_id = id(ts_enc)
+    if obj_id in _TIMESTEP_ENCODER_PATCHED:
+        return
+
+    try:
+        fallback_dtype = next(ts_enc.parameters()).dtype
+    except StopIteration:
+        fallback_dtype = torch.float32
+    ts_enc._fsdp_fallback_dtype = fallback_dtype
+
+    def _safe_forward(timesteps):
+        try:
+            dtype = next(ts_enc.parameters()).dtype
+        except StopIteration:
+            dtype = ts_enc._fsdp_fallback_dtype
+        timesteps_proj = ts_enc.time_proj(timesteps).to(dtype)
+        timesteps_emb = ts_enc.timestep_embedder(timesteps_proj)
+        return timesteps_emb
+
+    ts_enc.forward = _safe_forward
+    _TIMESTEP_ENCODER_PATCHED.add(obj_id)
 
 
 def _build_dual_dino_features(
@@ -86,8 +123,7 @@ def _build_dual_dino_features(
             "Dual action head requires dino_encoder and dino_pro on the model."
         )
 
-    flat_views = [img for ws in wrist_views for img in ws]
-    dino_input = dino_encoder.prepare_dino_input(flat_views)
+    dino_input = dino_encoder.prepare_dino_input(wrist_views)
     with torch.autocast("cuda", dtype=torch.bfloat16):
         dino_feats = dino_encoder(dino_input)
 
@@ -106,8 +142,9 @@ def _resolve_flowmatching_head_profile(
             "Flowmatching handler only supports action heads "
             f"{sorted(_FLOW_PREFIX_BY_ACTION_HEAD)}, got action_head_type={action_head_name!r}."
         )
-    flow_prefix = _FLOW_PREFIX_BY_ACTION_HEAD[action_head_name]
+    flow_prefix = action_head_name
     head = policy.starvla_model.action_model
+    _patch_timestep_encoder_for_fsdp(head)
     return action_head_name, flow_prefix, head
 
 
@@ -117,7 +154,7 @@ def _finalize_flowmatching_context(
     action_head_name: str,
     flow_prefix: str,
     head: nn.Module,
-    backbone_output: BackboneOutput,
+    backbone_output: dict[str, Any],
     state_source: Optional[torch.Tensor],
     state_adapter_name: str,
     state_context: str,
@@ -128,13 +165,13 @@ def _finalize_flowmatching_context(
         expected_layers = len(
             policy.starvla_model.action_model.model.transformer_blocks
         )
-        if len(backbone_output.hidden_layers) < expected_layers:
+        if len(backbone_output["hidden_layers"]) < expected_layers:
             raise RuntimeError(
                 "Backbone does not provide enough hidden layers for PI action head: "
-                f"need {expected_layers}, got {len(backbone_output.hidden_layers)}. "
+                f"need {expected_layers}, got {len(backbone_output['hidden_layers'])}. "
                 "This backbone cannot drive layer-wise PI head as configured."
             )
-        vl_embs_list = tuple(backbone_output.hidden_layers[-expected_layers:])
+        vl_embs_list = tuple(backbone_output["hidden_layers"][-expected_layers:])
         base_hidden = vl_embs_list[-1]
         action_head_inputs: dict[str, Any] = {
             "velocity_mode": "pi",
@@ -146,9 +183,9 @@ def _finalize_flowmatching_context(
     elif action_head_name == "gr00t":
         action_head_inputs = {
             "velocity_mode": "gr00t",
-            "rollout_hidden": backbone_output.last_hidden,
-            "value_hidden": backbone_output.last_hidden,
-            "vl_embs": backbone_output.last_hidden,
+            "rollout_hidden": backbone_output["last_hidden"],
+            "value_hidden": backbone_output["last_hidden"],
+            "vl_embs": backbone_output["last_hidden"],
             "vl_embs_list": None,
         }
     elif action_head_name == "dual":
@@ -159,14 +196,14 @@ def _finalize_flowmatching_context(
         )
         connect_idx = int(getattr(cfg, "connect_layer_index", -1))
         try:
-            cond_hidden = backbone_output.hidden_layers[connect_idx]
+            cond_hidden = backbone_output["hidden_layers"][connect_idx]
         except IndexError as exc:
             raise RuntimeError(
                 f"Invalid connect_layer_index={connect_idx} for hidden_layers size "
-                f"{len(backbone_output.hidden_layers)}."
+                f"{len(backbone_output['hidden_layers'])}."
             ) from exc
 
-        dino_features = backbone_output.model_inputs.get("dino_features")
+        dino_features = backbone_output["model_inputs"].get("dino_features")
         if isinstance(dino_features, torch.Tensor):
             cond_hidden = torch.cat(
                 (
@@ -178,7 +215,7 @@ def _finalize_flowmatching_context(
         action_head_inputs = {
             "velocity_mode": "gr00t",
             "rollout_hidden": cond_hidden,
-            "value_hidden": backbone_output.last_hidden,
+            "value_hidden": backbone_output["last_hidden"],
             "vl_embs": cond_hidden,
             "vl_embs_list": None,
         }
@@ -253,12 +290,16 @@ def _predict_velocity(
         state_features = head.state_encoder(state_t)
 
     # Build the action-token sequence consumed by the DiT blocks.
-    action_features = head.action_encoder(actions_t, t_bucket_index)
+    if getattr(head, "action_encoder", None) is not None:
+        action_features = head.action_encoder(actions_t, t_bucket_index)
+    else:
+        raise RuntimeError(
+            "Missing action_encoder for flowmatching velocity prediction."
+        )
+
     if getattr(head.config, "add_pos_embed", False):
         pos_ids = torch.arange(
-            action_features.shape[1],
-            dtype=torch.long,
-            device=actions_t.device,
+            action_features.shape[1], dtype=torch.long, device=actions_t.device
         )
         action_features = action_features + head.position_embedding(pos_ids).unsqueeze(
             0
@@ -273,21 +314,12 @@ def _predict_velocity(
         else torch.cat((future_tokens, action_features), dim=1)
     )
 
-    # Encode the denoising timestep using the head's dtype-safe timestep path.
-    timestep_encoder = head.model.timestep_encoder
-    timestep_embedder = timestep_encoder.timestep_embedder
-    weight = getattr(getattr(timestep_embedder, "linear_1", None), "weight", None)
-    if weight is None:
-        weight = getattr(getattr(head.model, "proj_out_1", None), "weight", None)
-    timestep_dtype = weight.dtype if isinstance(weight, torch.Tensor) else torch.float32
-    timestep_proj = timestep_encoder.time_proj(t_bucket_index.long()).to(
-        dtype=timestep_dtype
-    )
-    temb = timestep_embedder(timestep_proj)
-
     # Run the DiT stack in the head-specific conditioning mode.
-    model_output = sa_embs
     if velocity_mode == "pi":
+        # PI mode requires per-layer encoder_hidden_states which DiT.forward
+        # does not support, so we must manually unroll the transformer blocks.
+        temb = head.model.timestep_encoder(t_bucket_index.long())
+        model_output = sa_embs
         assert isinstance(vl_ctx, tuple)
         for layer_idx, layer in enumerate(head.model.transformer_blocks):
             model_output = layer(
@@ -296,33 +328,13 @@ def _predict_velocity(
                 temb=temb,
             )
     else:
+        # GR00T mode: delegate to DiT.forward directly.
         assert isinstance(vl_ctx, torch.Tensor)
-        interleave = bool(
-            getattr(head.model.config, "interleave_self_attention", False)
+        model_output = head.model(
+            hidden_states=sa_embs,
+            encoder_hidden_states=vl_ctx,
+            timestep=t_bucket_index,
         )
-        for idx, layer in enumerate(head.model.transformer_blocks):
-            # If interleaving is enabled, odd layers attend only to the SA embeddings
-            # and even layers attend to the visual context.
-            if idx % 2 == 1 and interleave:
-                model_output = layer(
-                    hidden_states=model_output,
-                    encoder_hidden_states=None,
-                    encoder_attention_mask=None,
-                    temb=temb,
-                )
-            else:
-                model_output = layer(
-                    hidden_states=model_output,
-                    encoder_hidden_states=vl_ctx,
-                    encoder_attention_mask=None,
-                    temb=temb,
-                )
-        # Apply FiLM conditioning from the timestep embedding after the DiT stack.
-        shift, scale = head.model.proj_out_1(F.silu(temb)).chunk(2, dim=1)
-        model_output = (
-            head.model.norm_out(model_output) * (1 + scale[:, None]) + shift[:, None]
-        )
-        model_output = head.model.proj_out_2(model_output)
 
     # Decode the predicted velocity and keep only the action-horizon suffix.
     pred = head.action_decoder(model_output)
@@ -377,12 +389,15 @@ def run_default_forward_flowmatching(
     )
     backbone_output = run_backbone_pipeline(
         policy,
+        action_head_name=action_head_name,
         model_inputs=model_inputs,
         use_cache=use_cache,
     )
-    state_source = data.get("state")
-    if state_source is None:
-        state_source = data.get("states")
+    state_source = None
+    if policy.uses_state_input:
+        state_source = data.get("state")
+        if state_source is None:
+            state_source = data.get("states")
     state_adapter_name = str(policy.state_adapter_type).lower() or action_head_name
     flow_ctx = _finalize_flowmatching_context(
         policy,
@@ -472,58 +487,69 @@ def run_default_forward_flowmatching(
             )
         resolved_step_std = resolved_step_std * float(sqrt(dt))
 
+    # Match the rollout path which runs ODE integration under fp32 autocast
+    # to avoid bf16 truncation errors accumulating over Euler steps.
+    fp32_ctx = (
+        torch.autocast("cuda", dtype=torch.float32)
+        if rollout_hidden.is_cuda
+        else nullcontext()
+    )
+
     step_logprobs: list[torch.Tensor] = []
     step_entropy: list[torch.Tensor] = []
-    for step in range(num_steps):
-        actions_pre_step = chain_actions[:, step]
-        actions_next_step = chain_actions[:, step + 1]
-        t_bucket_step = t_bucket_indices[:, step]
+    with fp32_ctx:
+        for step in range(num_steps):
+            actions_pre_step = chain_actions[:, step]
+            actions_next_step = chain_actions[:, step + 1]
+            t_bucket_step = t_bucket_indices[:, step]
 
-        pred_velocity = _predict_velocity(
-            policy,
-            head=head,
-            action_head_inputs=action_head_inputs,
-            actions_t=actions_pre_step,
-            state_t=state,
-            t_bucket_index=t_bucket_step,
-        )
-        mean_next = actions_pre_step + dt * pred_velocity
+            pred_velocity = _predict_velocity(
+                policy,
+                head=head,
+                action_head_inputs=action_head_inputs,
+                actions_t=actions_pre_step,
+                state_t=state,
+                t_bucket_index=t_bucket_step,
+            )
+            mean_next = actions_pre_step + dt * pred_velocity
 
-        if do_sample:
-            active_step_mask = denoise_inds[:, step].eq(step)
-            if bool(active_step_mask.any()):
-                if resolved_step_std is None:
-                    raise RuntimeError(
-                        "Internal error: missing step_std for flowmatching sampled transition."
+            if do_sample:
+                active_step_mask = denoise_inds[:, step].eq(step)
+                if bool(active_step_mask.any()):
+                    if resolved_step_std is None:
+                        raise RuntimeError(
+                            "Internal error: missing step_std for flowmatching sampled transition."
+                        )
+                    dist_step = Normal(
+                        mean_next, resolved_step_std.expand_as(mean_next)
                     )
-                dist_step = Normal(mean_next, resolved_step_std.expand_as(mean_next))
-                active_step_mask_3d = active_step_mask.view(-1, 1, 1)
-                if compute_logprobs:
-                    logprob_step = dist_step.log_prob(actions_next_step)
-                    logprob_step = torch.where(
-                        active_step_mask_3d,
-                        logprob_step,
-                        torch.zeros_like(logprob_step),
-                    )
-                    step_logprobs.append(logprob_step)
-                if compute_entropy:
-                    entropy_step = dist_step.entropy()
-                    entropy_step = torch.where(
-                        active_step_mask_3d,
-                        entropy_step,
-                        torch.zeros_like(entropy_step),
-                    )
-                    step_entropy.append(entropy_step)
+                    active_step_mask_3d = active_step_mask.view(-1, 1, 1)
+                    if compute_logprobs:
+                        logprob_step = dist_step.log_prob(actions_next_step)
+                        logprob_step = torch.where(
+                            active_step_mask_3d,
+                            logprob_step,
+                            torch.zeros_like(logprob_step),
+                        )
+                        step_logprobs.append(logprob_step)
+                    if compute_entropy:
+                        entropy_step = dist_step.entropy()
+                        entropy_step = torch.where(
+                            active_step_mask_3d,
+                            entropy_step,
+                            torch.zeros_like(entropy_step),
+                        )
+                        step_entropy.append(entropy_step)
+                else:
+                    if compute_logprobs:
+                        step_logprobs.append(torch.zeros_like(actions_next_step))
+                    if compute_entropy:
+                        step_entropy.append(torch.zeros_like(actions_next_step))
             else:
                 if compute_logprobs:
                     step_logprobs.append(torch.zeros_like(actions_next_step))
                 if compute_entropy:
                     step_entropy.append(torch.zeros_like(actions_next_step))
-        else:
-            if compute_logprobs:
-                step_logprobs.append(torch.zeros_like(actions_next_step))
-            if compute_entropy:
-                step_entropy.append(torch.zeros_like(actions_next_step))
 
     result: dict[str, torch.Tensor | None] = {
         "logprobs": None,
@@ -549,7 +575,7 @@ def run_default_forward_flowmatching(
             result["values"] = compute_values_from_hidden(
                 value_head=policy.value_head,
                 hidden=action_head_inputs["value_hidden"],
-                attention_mask=backbone_output.attention_mask,
+                attention_mask=backbone_output["attention_mask"],
             )
     return result
 
@@ -565,28 +591,28 @@ def run_rollout_flowmatching(
     env_obs: dict[str, Any],
 ) -> dict[str, Any]:
     """Roll out flowmatching actions and pack replay caches for training."""
-    action_head_name, flow_prefix, head = _resolve_flowmatching_head_profile(policy)
+    action_head_name, _, head = _resolve_flowmatching_head_profile(policy)
 
     # Run the backbone on live examples and attach any head-specific extras needed downstream.
     backbone_output = run_backbone_pipeline(
         policy,
+        action_head_name=action_head_name,
         examples=examples,
         use_cache=False,
     )
     if action_head_name == "dual":
         dino_features = _build_dual_dino_features(
-            policy.starvla_model,
-            examples=examples,
+            policy.starvla_model, examples=examples
         )
-        backbone_output.model_inputs["dino_features"] = dino_features
+        backbone_output["model_inputs"]["dino_features"] = dino_features
 
     flow_ctx = _finalize_flowmatching_context(
         policy,
         action_head_name=action_head_name,
-        flow_prefix=flow_prefix,
+        flow_prefix=action_head_name,
         head=head,
         backbone_output=backbone_output,
-        state_source=env_obs.get("states"),
+        state_source=(env_obs.get("states") if policy.uses_state_input else None),
         state_adapter_name=str(policy.state_adapter_type).lower(),
         state_context=f"rollout_{action_head_name}",
     )
@@ -597,8 +623,6 @@ def run_rollout_flowmatching(
     rollout_hidden = flow_ctx["rollout_hidden"]
     state = flow_ctx["state"]
 
-    action_horizon = int(getattr(head, "action_horizon", policy.num_action_chunks))
-    action_dim = int(getattr(head, "action_dim", policy.action_dim))
     num_steps = max(1, int(getattr(head, "num_inference_timesteps", 16)))
     sample_actions = bool(sampling_kwargs.get("do_sample")) and mode == "train"
 
@@ -626,82 +650,97 @@ def run_rollout_flowmatching(
             dtype=torch.long,
         )
 
-    dt = 1.0 / float(max(1, num_steps))
-    actions_t = torch.randn(
-        (batch_size, action_horizon, action_dim),
-        dtype=rollout_hidden.dtype,
-        device=rollout_hidden.device,
+    action_horizon = int(getattr(head, "action_horizon", policy.num_action_chunks))
+    action_dim = int(getattr(head, "action_dim", policy.action_dim))
+
+    # Match starVLA official QwenGR00T.predict_action which runs the action
+    # model under torch.autocast("cuda", dtype=torch.float32).  Without this,
+    # the ODE integration inherits bf16 from the backbone and accumulates
+    # truncation errors over num_steps Euler steps.
+    fp32_ctx = (
+        torch.autocast("cuda", dtype=torch.float32)
+        if rollout_hidden.is_cuda
+        else nullcontext()
     )
 
-    step_std = None
-    if sample_actions:
-        step_std = (
-            torch.exp(policy.actor_logstd)
-            .to(device=actions_t.device, dtype=actions_t.dtype)
-            .view(1, 1, -1)
+    with fp32_ctx:
+        actions_t = torch.randn(
+            (batch_size, action_horizon, action_dim),
+            dtype=rollout_hidden.dtype,
+            device=rollout_hidden.device,
         )
-        if step_std.shape[-1] != action_dim:
-            raise RuntimeError(
-                f"Mismatch between resolved step_std shape {step_std.shape} and expected action_dim {action_dim} for sampled flowmatching rollout."
-            )
-        step_std = step_std * float(dt**0.5)
 
-    chain_actions: list[torch.Tensor] = [actions_t]
-    t_bucket_indices: list[torch.Tensor] = []
-    step_logprobs: list[torch.Tensor] = []
-    num_timestep_buckets = int(getattr(head, "num_timestep_buckets", 1000))
+        dt = 1.0 / float(max(1, num_steps))
 
-    for step in range(num_steps):
-        t_continuous = step / float(max(1, num_steps))
-        t_bucket = int(t_continuous * num_timestep_buckets)
-        t_bucket_index = torch.full(
-            (batch_size,),
-            t_bucket,
-            device=actions_t.device,
-            dtype=torch.long,
-        )
-        t_bucket_indices.append(t_bucket_index)
-
-        pred_velocity = _predict_velocity(
-            policy,
-            head=head,
-            action_head_inputs=action_head_inputs,
-            actions_t=actions_t,
-            state_t=state,
-            t_bucket_index=t_bucket_index,
-        )
-        mean_next = actions_t + dt * pred_velocity
-
+        step_std = None
         if sample_actions:
-            if step_std is None:
+            step_std = (
+                torch.exp(policy.actor_logstd)
+                .to(device=actions_t.device, dtype=actions_t.dtype)
+                .view(1, 1, -1)
+            )
+            if step_std.shape[-1] != action_dim:
                 raise RuntimeError(
-                    "Internal error: missing step_std for sampled transition."
+                    f"Mismatch between resolved step_std shape {step_std.shape} and expected action_dim {action_dim} for sampled flowmatching rollout."
                 )
-            active_step_mask = denoise_inds[:, step].eq(step)
-            if bool(active_step_mask.any()):
-                dist_step = Normal(mean_next, step_std.expand_as(mean_next))
-                sampled_actions = dist_step.rsample()
-                active_step_mask_3d = active_step_mask.view(-1, 1, 1)
-                next_actions_preclip = torch.where(
-                    active_step_mask_3d,
-                    sampled_actions,
-                    mean_next,
-                )
-                if calculate_logprobs:
-                    logprob_step = dist_step.log_prob(next_actions_preclip)
-                    logprob_step = torch.where(
-                        active_step_mask_3d,
-                        logprob_step,
-                        torch.zeros_like(logprob_step),
+            step_std = step_std * float(dt**0.5)
+
+        chain_actions: list[torch.Tensor] = [actions_t]
+        t_bucket_indices: list[torch.Tensor] = []
+        step_logprobs: list[torch.Tensor] = []
+        num_timestep_buckets = int(getattr(head, "num_timestep_buckets", 1000))
+
+        for step in range(num_steps):
+            t_continuous = step / float(max(1, num_steps))
+            t_bucket = int(t_continuous * num_timestep_buckets)
+
+            t_bucket_index = torch.full(
+                size=(batch_size,),
+                fill_value=t_bucket,
+                device=actions_t.device,
+            )
+            t_bucket_indices.append(t_bucket_index)
+
+            pred_velocity = _predict_velocity(
+                policy,
+                head=head,
+                action_head_inputs=action_head_inputs,
+                actions_t=actions_t,
+                state_t=state,
+                t_bucket_index=t_bucket_index,
+            )
+            mean_next = actions_t + dt * pred_velocity
+
+            if sample_actions:
+                if step_std is None:
+                    raise RuntimeError(
+                        "Internal error: missing step_std for sampled transition."
                     )
-                    step_logprobs.append(logprob_step)
+                active_step_mask = denoise_inds[:, step].eq(step)
+                if bool(active_step_mask.any()):
+                    dist_step = Normal(mean_next, step_std.expand_as(mean_next))
+                    sampled_actions = dist_step.rsample()
+                    active_step_mask_3d = active_step_mask.view(-1, 1, 1)
+                    next_actions_preclip = torch.where(
+                        active_step_mask_3d,
+                        sampled_actions,
+                        mean_next,
+                    )
+                    if calculate_logprobs:
+                        logprob_step = dist_step.log_prob(next_actions_preclip)
+                        logprob_step = torch.where(
+                            active_step_mask_3d,
+                            logprob_step,
+                            torch.zeros_like(logprob_step),
+                        )
+                        step_logprobs.append(logprob_step)
+                else:
+                    next_actions_preclip = mean_next
             else:
                 next_actions_preclip = mean_next
-        else:
-            next_actions_preclip = mean_next
 
-        actions_t = next_actions_preclip
-        chain_actions.append(actions_t)
+            actions_t = next_actions_preclip
+            chain_actions.append(actions_t)
 
     prev_logprobs: Optional[torch.Tensor] = None
     if calculate_logprobs:
@@ -712,21 +751,19 @@ def run_rollout_flowmatching(
         else:
             prev_logprobs = torch.zeros_like(actions_t, dtype=torch.float32)
 
-    actions_exec = action_space_utils.clip_actions_for_env(actions_t)
-
     prev_values: Optional[torch.Tensor] = None
     if calculate_values:
         if policy.value_head is None:
             prev_values = torch.zeros(
-                (actions_exec.shape[0], 1),
-                device=actions_exec.device,
+                (actions_t.shape[0], 1),
+                device=actions_t.device,
                 dtype=torch.float32,
             )
         else:
             prev_values = compute_values_from_hidden(
                 value_head=policy.value_head,
                 hidden=action_head_inputs["value_hidden"],
-                attention_mask=backbone_output.attention_mask,
+                attention_mask=backbone_output["attention_mask"],
             )
 
     flow_cache: dict[str, torch.Tensor] = {
@@ -734,18 +771,16 @@ def run_rollout_flowmatching(
         f"{flow_prefix}_t_bucket_indices": torch.stack(t_bucket_indices, dim=1),
         f"{flow_prefix}_denoise_inds": denoise_inds,
         f"{flow_prefix}_sample_actions": torch.tensor(
-            int(sample_actions),
-            device=actions_t.device,
-            dtype=torch.int64,
+            int(sample_actions), device=actions_t.device, dtype=torch.int64
         ),
     }
     return {
         "output": {
             "normalized_actions": data_pipeline_utils.tensor_to_numpy_compatible(
-                actions_exec
+                actions_t
             )
         },
-        "model_inputs": backbone_output.model_inputs,
+        "model_inputs": backbone_output["model_inputs"],
         "prev_logprobs": prev_logprobs,
         "prev_values": prev_values,
         "extra_forward_inputs": flow_cache,

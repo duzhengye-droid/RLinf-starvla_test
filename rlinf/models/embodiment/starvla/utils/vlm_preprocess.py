@@ -18,84 +18,47 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-import numpy as np
 import torch
-from PIL import Image
+from deployment.model_server.tools.image_tools import to_pil_preserve
+from starVLA.training.trainer_utils.trainer_tools import (
+    resize_images as resize_images,
+)
 
 from .profile import resolve_vlm_interface
 
 
-def _to_uint8_image_array(arr: np.ndarray) -> np.ndarray:
-    """Convert arbitrary image array to uint8 in [0, 255]."""
-    if np.issubdtype(arr.dtype, np.floating):
-        arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)
-        max_val = float(np.max(arr)) if arr.size > 0 else 0.0
-        min_val = float(np.min(arr)) if arr.size > 0 else 0.0
-        if max_val <= 1.0 and min_val >= 0.0:
-            arr = np.clip(arr, 0.0, 1.0) * 255.0
-        else:
-            arr = np.clip(arr, 0.0, 255.0)
-        arr = np.rint(arr).astype(np.uint8)
-    elif arr.dtype != np.uint8:
-        arr = np.clip(arr, 0, 255).astype(np.uint8)
-    return arr
+def get_train_image_size(
+    starvla_model: Any,
+) -> Optional[tuple[int, int] | int]:
+    """Read training image size from checkpoint config if provided.
 
-
-def to_pil_preserve(image: Any):
-    """Convert tensor/ndarray(/nested views) to PIL while preserving structure."""
-
-    def _convert(obj: Any):
-        if isinstance(obj, list):
-            return [_convert(item) for item in obj]
-        if isinstance(obj, tuple):
-            return tuple(_convert(item) for item in obj)
-        if isinstance(obj, Image.Image):
-            return obj
-        if torch.is_tensor(obj):
-            arr = obj.detach().cpu().numpy()
-        elif isinstance(obj, np.ndarray):
-            arr = obj
-        else:
-            raise TypeError(f"Unsupported image type: {type(obj)}")
-
-        if arr.ndim == 2:
-            return Image.fromarray(_to_uint8_image_array(arr), mode="L")
-        if arr.ndim != 3:
-            raise ValueError(
-                f"Expected image array with ndim 2/3, got shape={arr.shape}."
-            )
-
-        if arr.shape[-1] not in (1, 3, 4) and arr.shape[0] in (1, 3, 4):
-            arr = np.moveaxis(arr, 0, -1)
-        if arr.shape[-1] not in (1, 3, 4):
-            raise ValueError(f"Unsupported channel count: shape={arr.shape}.")
-
-        arr = _to_uint8_image_array(arr)
-        if arr.shape[-1] == 1:
-            return Image.fromarray(arr[..., 0], mode="L")
-        if arr.shape[-1] == 3:
-            return Image.fromarray(arr, mode="RGB")
-        return Image.fromarray(arr, mode="RGBA")
-
-    return _convert(image)
-
-
-def resize_images(images: list[Image.Image], target_size: int):
-    """Resize images with starVLA's training-time resize utility."""
-    from starVLA.training.trainer_utils.trainer_tools import (
-        resize_images as _resize_images,
-    )
-
-    return _resize_images(images, target_size=target_size)
-
-
-def get_train_image_size(starvla_model: Any) -> Optional[int]:
-    """Read training image size from checkpoint config if provided."""
+    Checks ``datasets.vla_data.image_size`` first, then falls back to
+    ``datasets.vla_data.default_image_resolution`` (format ``[C, H, W]``)
+    which many starVLA training configs use instead.
+    """
     cfg = getattr(starvla_model, "config", None)
     if cfg is None:
         return None
     vla_data = getattr(getattr(cfg, "datasets", None), "vla_data", None)
-    return getattr(vla_data, "image_size", None) if vla_data is not None else None
+    if vla_data is None:
+        return None
+
+    size = getattr(vla_data, "image_size", None)
+    if size is not None:
+        return size
+
+    default_res = getattr(vla_data, "default_image_resolution", None)
+    if default_res is not None:
+        try:
+            res = list(default_res)
+        except (TypeError, ValueError):
+            return None
+        if len(res) == 3:
+            return (int(res[1]), int(res[2]))
+        if len(res) == 2:
+            return (int(res[0]), int(res[1]))
+
+    return None
 
 
 def build_base_vlm_inputs(

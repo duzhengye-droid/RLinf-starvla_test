@@ -37,6 +37,7 @@ def build_examples_from_env_obs(
     env_obs: dict[str, Any],
     state_adapter_name: str,
     prepare_state_tensor: Callable[..., Optional[torch.Tensor]],
+    include_state: bool = True,
 ) -> list[dict[str, Any]]:
     """Convert env observations into starVLA 'examples' format."""
     main_images = env_obs["main_images"]
@@ -77,7 +78,7 @@ def build_examples_from_env_obs(
             "lang": "" if task_desc is None else str(task_desc[i]),
         }
 
-        if states is not None:
+        if include_state and states is not None:
             state_i = prepare_state_tensor(
                 states[i],
                 state_adapter_name=state_adapter_name,

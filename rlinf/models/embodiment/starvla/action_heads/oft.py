@@ -19,11 +19,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import torch
+from deployment.model_server.tools.image_tools import to_pil_preserve
+from starVLA.training.trainer_utils.trainer_tools import (
+    resize_images as starvla_resize_images,
+)
 from torch.distributions.normal import Normal
 
-from ..utils import action_space as action_space_utils
 from ..utils import data_pipeline as data_pipeline_utils
-from ..utils import vlm_preprocess as vlm_input_utils
 from ..utils.backbone_pipeline import compute_values_from_hidden, run_backbone_pipeline
 from ..utils.profile import (
     RL_BATCH_TENSOR_KEYS_TO_IGNORE,
@@ -42,16 +44,15 @@ def _build_oft_vlm_inputs(
     examples: list[dict[str, Any]],
 ) -> dict[str, torch.Tensor]:
     """Build OFT prompt format by appending action-token placeholders."""
-    batch_images = [
-        vlm_input_utils.to_pil_preserve(example["image"]) for example in examples
-    ]
+    batch_images = [to_pil_preserve(example["image"]) for example in examples]
     instructions = [example["lang"] for example in examples]
 
-    train_obs_image_size = vlm_input_utils.get_train_image_size(starvla_model)
+    from ..utils.vlm_preprocess import get_train_image_size
+
+    train_obs_image_size = get_train_image_size(starvla_model)
     if train_obs_image_size:
-        batch_images = vlm_input_utils.resize_images(
-            batch_images,
-            target_size=train_obs_image_size,
+        batch_images = starvla_resize_images(
+            batch_images, target_size=train_obs_image_size
         )
 
     chunk_len = resolve_action_chunk_len(
@@ -67,16 +68,15 @@ def _build_oft_vlm_inputs(
     )
     instructions = [instruction + prompt_suffix for instruction in instructions]
 
-    vlm_interface = resolve_vlm_interface(starvla_model)
-    build_inputs = getattr(vlm_interface, "build_qwenvl_inputs", None)
+    qwen_vl_interface = getattr(starvla_model, "qwen_vl_interface", None)
+    build_inputs = getattr(qwen_vl_interface, "build_qwenvl_inputs", None)
+    # TODO: Whether this fallback is necessary. need further test
+    if not callable(build_inputs):
+        vlm_interface = resolve_vlm_interface(starvla_model)
+        build_inputs = getattr(vlm_interface, "build_qwenvl_inputs", None)
     if not callable(build_inputs):
         raise RuntimeError("VLM interface does not provide 'build_qwenvl_inputs(...)'.")
-    return dict(
-        build_inputs(
-            images=batch_images,
-            instructions=instructions,
-        )
-    )
+    return build_inputs(images=batch_images, instructions=instructions)
 
 
 def _run_oft_backbone_and_head(
@@ -88,18 +88,19 @@ def _run_oft_backbone_and_head(
     """Run the shared OFT backbone/action-head path."""
     backbone_output = run_backbone_pipeline(
         policy,
+        action_head_name="oft",
         model_inputs=model_inputs,
         use_cache=use_cache,
     )
     model = policy.starvla_model
-    last_hidden = backbone_output.last_hidden
-    input_ids = model_inputs["input_ids"]
-    action_queries = model._gather_action_token_embeddings(
-        last_hidden,
-        input_ids,
-        action_token_id=getattr(model, "action_token_id", None),
-    )
+    last_hidden = backbone_output["last_hidden"]
     with torch.autocast("cuda", dtype=torch.float32):
+        input_ids = model_inputs["input_ids"]
+        action_queries = model._gather_action_token_embeddings(
+            last_hidden,
+            input_ids,
+            action_token_id=getattr(model, "action_token_id", None),
+        )
         mean_actions = model.action_model.predict_action(action_queries)
 
     dist = Normal(mean_actions, torch.exp(policy.actor_logstd).view(1, 1, -1))
@@ -185,10 +186,8 @@ def run_rollout_oft(
         model_inputs=model_inputs,
         use_cache=False,
     )
-
     sample_actions = bool(sampling_kwargs.get("do_sample")) and mode == "train"
     actions_for_logprob = dist.sample() if sample_actions else mean_actions
-    actions_exec = action_space_utils.clip_actions_for_env(actions_for_logprob)
 
     prev_logprobs = None
     prev_values = None
@@ -204,7 +203,7 @@ def run_rollout_oft(
     return {
         "output": {
             "normalized_actions": data_pipeline_utils.tensor_to_numpy_compatible(
-                actions_exec
+                mean_actions
             )
         },
         "model_inputs": model_inputs,

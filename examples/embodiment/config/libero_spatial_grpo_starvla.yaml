@@ -134,6 +134,7 @@ actor:
       framework_name: "QwenOFT"
       expected_action_dim: ${actor.model.action_dim}
       expected_num_action_chunks: ${actor.model.num_action_chunks}
+      enable_state_input: False
 
   optim:
     lr: 1.0e-5

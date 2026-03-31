@@ -94,6 +94,10 @@ def get_model(
     if framework_name:
         starvla_model.framework_name = framework_name
 
+    enable_state_input = getattr(starvla_cfg, "enable_state_input", None)
+    if enable_state_input is None:
+        enable_state_input = getattr(cfg, "enable_state_input", True)
+
     # Cast to requested dtype.
     if torch_dtype is not None:
         starvla_model = starvla_model.to(dtype=torch_dtype)
@@ -104,6 +108,9 @@ def get_model(
         num_action_chunks=cfg.num_action_chunks,
         add_value_head=getattr(cfg, "add_value_head", True),
         unnorm_key=getattr(cfg, "unnorm_key", None),
+        action_stats_source=getattr(cfg, "action_stats_source", "minmax"),
+        enable_state_input=enable_state_input,
+        policy_setup=getattr(cfg, "policy_setup", None),
     )
 
 
