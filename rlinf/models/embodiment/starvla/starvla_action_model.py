@@ -282,7 +282,9 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
             output = payload["output"]
             model_inputs = payload.get("model_inputs", {})
             if not isinstance(model_inputs, dict):
-                model_inputs = {}
+                model_inputs = (
+                    dict(model_inputs) if hasattr(model_inputs, "items") else {}
+                )
             prev_logprobs = payload.get("prev_logprobs")
             prev_values = payload.get("prev_values")
             extra_forward_inputs = payload.get("extra_forward_inputs", {})
