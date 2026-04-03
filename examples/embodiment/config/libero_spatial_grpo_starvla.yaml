@@ -130,6 +130,7 @@ actor:
     num_action_chunks: 8
     unnorm_key: franka # starVLA action-stats key for LIBERO Franka tasks.
     add_value_head: False
+    action_stats_source: "minmax"
     starvla:
       framework_name: "QwenOFT"
       expected_action_dim: ${actor.model.action_dim}

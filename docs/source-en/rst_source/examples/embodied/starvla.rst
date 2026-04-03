@@ -195,10 +195,12 @@ Key config snippet
        model_path: "/path/to/model"
        action_dim: 7
        num_action_chunks: 8
+       action_stats_source: "minmax"
        starvla:
          framework_name: "QwenOFT"
          expected_action_dim: ${actor.model.action_dim}
          expected_num_action_chunks: ${actor.model.num_action_chunks}
+         enable_state_input: False
 
 Run training
 ^^^^^^^^^^^^
