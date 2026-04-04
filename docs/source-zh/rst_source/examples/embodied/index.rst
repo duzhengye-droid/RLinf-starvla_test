@@ -412,8 +412,5 @@
    dsrl
    dagger
    co_training
-   franka
-   franka_zed_robotiq
    franka_gello
    hg-dagger
-   xsquare_turtle2
