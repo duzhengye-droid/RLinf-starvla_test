@@ -441,17 +441,17 @@ as well as reinforcement learning training examples on real robots.
    gr00t
    lingbotvla
    dexbotic
-   starvla
-   franka
-   franka_zed_robotiq
-   xsquare_turtle2
    mlp
    sac_flow
    sft_openpi
    sft_vlm
+   starvla
    nft_openpi
    dsrl
    dagger
    co_training
+   franka
+   franka_zed_robotiq
    franka_gello
    hg-dagger
+   xsquare_turtle2
