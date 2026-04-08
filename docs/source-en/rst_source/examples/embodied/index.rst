@@ -211,6 +211,17 @@ as well as reinforcement learning training examples on real robots.
        </p>
      </div>
 
+    <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
+      <img src="https://github.com/RLinf/misc/raw/main/pic/starvla.png"
+          style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);" />
+      <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
+        <a href="starvla.html" style="text-decoration: underline; color: blue;">
+          <b>RL on StarVLA Models</b>
+        </a><br>
+        StarVLA + LIBERO + GRPO embodied RL training
+      </p>
+    </div>
+
      <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
        <img src="https://github.com/RLinf/misc/raw/main/pic/3_layer_mlp.jpg"
             style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);"
@@ -224,56 +235,6 @@ as well as reinforcement learning training examples on real robots.
      </div>
   </div>
 
-  <div style="display: flex; justify-content: center; gap: 20px; align-items: flex-start; flex-wrap: wrap;">
-    <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
-      <img src="https://github.com/RLinf/misc/raw/main/pic/franka_arm_small.jpg"
-          style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);" />
-      <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
-        <a href="co_training.html" style="text-decoration: underline; color: blue;">
-          <b>Sim-Real Co-Training</b>
-        </a><br>
-        PPO in sim + SFT on real data for better sim-to-real transfer
-      </p>
-    </div>
-
-    <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
-      <img src="https://github.com/RLinf/misc/raw/main/pic/dsrl.png"
-          style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);" />
-      <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
-        <a href="dsrl.html" style="text-decoration: underline; color: blue;">
-          <b>DSRL for Pi0</b>
-        </a><br>
-        Steer a frozen Pi0 diffusion policy with lightweight SAC in noise space
-      </p>
-    </div>
-
-    <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
-      <img src="https://github.com/RLinf/misc/raw/main/pic/starvla.png"
-          style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);" />
-      <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
-        <a href="starvla.html" style="text-decoration: underline; color: blue;">
-          <b>RL on StarVLA Models</b>
-        </a><br>
-        StarVLA + LIBERO + GRPO embodied RL training
-      </p>
-    </div>
-    
-    <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
-      <img src="https://github.com/RLinf/misc/raw/main/pic/xsquare_turtle2_arm_small.jpg"
-          style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);" />
-      <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
-       <a href="xsquare_turtle2.html" style="text-decoration: underline; color: blue;">
-          <b>Real-World RL with XSquare Turtle2</b>
-        </a><br>
-        SAC + CNN policy on the XSquare Turtle2 dual-arm robot
-      </p>
-    </div>
-  </div>
-
-  <div style="display: flex; justify-content: center; gap: 20px; align-items: flex-start; flex-wrap: wrap;">
-    <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
-       <img src="https://raw.githubusercontent.com/RLinf/misc/378920588652fff0a2a0b163b392c94694993345/pic/libero-plus.jpg" 
-   </div>
 
    <div style="display: flex; justify-content: center; gap: 20px; align-items: flex-start; flex-wrap: wrap;">
      <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
@@ -441,11 +402,11 @@ as well as reinforcement learning training examples on real robots.
    gr00t
    lingbotvla
    dexbotic
+   starvla
    mlp
    sac_flow
    sft_openpi
    sft_vlm
-   starvla
    nft_openpi
    dsrl
    dagger
